@@ -117,5 +117,12 @@ def main():
     print(f"Dominio Fuente  -> erank: {metricas_fuente['erank']:.2f}, DR: {metricas_fuente['DR']:.2f}, FFI: {metricas_fuente['FFI']:.4f}")
     print(f"Dominio Destino -> erank: {metricas_destino['erank']:.2f}, DR: {metricas_destino['DR']:.2f}, FFI: {metricas_destino['FFI']:.4f}")
 
+    # --- NUEVO: Guardar el modelo físicamente en el disco ---
+    import os
+    os.makedirs("./checkpoints", exist_ok=True)
+    nombre_archivo = f"./checkpoints/best_model_{args.method}_{args.source}_to_{args.target}_seed{args.seed}.pth"
+    torch.save(model.state_dict(), nombre_archivo)
+    print(f"\nModelo guardado en: {nombre_archivo}")
+
 if __name__ == '__main__':
     main()
