@@ -47,7 +47,7 @@ for method in "${METHODS[@]}"; do
                 --target $target_dom \
                 --data_dir $DATA_DIR \
                 --seed $seed \
-                --epochs $EPOCHS > "$LOG_FILE" 2>&1
+                --epochs $EPOCHS 2>&1 | tee "$LOG_FILE"
                 
         done
     done

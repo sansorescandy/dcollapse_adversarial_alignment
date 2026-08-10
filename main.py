@@ -91,8 +91,30 @@ def main():
         # Utilizamos nuestro trainer optimizado con Target Entropy
         model = train_dann(model, train_source, target_loader, num_epochs=args.epochs, device=device)
     else:
-        print("Entrenando Source-Only... (Implementar loop estándar de clasificación aquí)")
-        # Aquí iría un bucle simple de CrossEntropyLoss clásico sin la rama del discriminador.
+        print("Entrenando Source-Only...")
+        criterion = nn.CrossEntropyLoss()
+        # Solo optimizamos backbone y clasificador
+        optimizer = torch.optim.SGD([
+            {'params': model.backbone.parameters(), 'lr': 0.001},
+            {'params': model.classifier.parameters(), 'lr': 0.01}
+        ], momentum=0.9, weight_decay=5e-4)
+        
+        for epoch in range(args.epochs):
+            model.train()
+            epoch_loss = 0.0
+            for x, y in train_source:
+                x, y = x.to(device), y.to(device)
+                optimizer.zero_grad()
+                
+                # Pasamos alpha=0 para apagar el GRL
+                class_logits, _, _ = model(x, alpha=0.0)
+                loss = criterion(class_logits, y)
+                
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+                
+            print(f"Epoch [{epoch+1}/{args.epochs}] | Loss Cls: {epoch_loss/len(train_source):.4f}")
 
     # 5. Evaluación Final y Extracción de Tensores
     print("Extrayendo representaciones para diagnóstico de Feature Flattening...")
