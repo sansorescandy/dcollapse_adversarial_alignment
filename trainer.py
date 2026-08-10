@@ -17,7 +17,7 @@ def calculate_target_entropy(model, target_loader, device):
     total_samples = 0
     
     with torch.no_grad():
-        for x in target_loader:
+        for x, _ in target_loader:
             x = x.to(device)
             # Solo nos interesan los logits de clase, no el discriminador
             class_logits, _, _ = model(x, alpha=0.0) 
