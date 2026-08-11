@@ -1,155 +1,153 @@
+import os
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import math
-import numpy as np
+import torch.nn.functional as F
 
-# --------------------------------------------------------
-# 1. Función de Selección: Entropía en Destino (Target Entropy)
-# --------------------------------------------------------
-def calculate_target_entropy(model, target_loader, device):
-    """
-    Calcula la entropía media de las predicciones en el dominio destino.
-    Un valor menor indica que el modelo está más "seguro" de sus predicciones.
-    """
+def calculate_target_entropy(model, dataloader, device):
+    """Calcula la entropía de Shannon en el dominio destino (sin etiquetas)."""
     model.eval()
-    total_entropy = 0.0
-    total_samples = 0
+    entropies = []
+    with torch.no_grad():
+        for x, _ in dataloader:
+            x = x.to(device)
+            # Extraemos los logits, ignoramos logits de dominio y features
+            class_logits, _, _ = model(x, alpha=0.0)
+            
+            # Cálculo de la entropía
+            probs = F.softmax(class_logits, dim=1)
+            batch_entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1).mean()
+            entropies.append(batch_entropy.item())
+            
+    return sum(entropies) / len(entropies)
+
+def evaluate_source_domain(model, dataloader, device):
+    """Evalúa la pérdida de clasificación y precisión en el dominio origen."""
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    criterion = nn.CrossEntropyLoss()
     
     with torch.no_grad():
-        for x, _ in target_loader:
-            x = x.to(device)
-            # Solo nos interesan los logits de clase, no el discriminador
-            class_logits, _, _ = model(x, alpha=0.0) 
+        for x, y in dataloader:
+            x, y = x.to(device), y.to(device)
+            class_logits, _, _ = model(x, alpha=0.0)
             
-            # Convertir logits a probabilidades
-            probs = nn.Softmax(dim=1)(class_logits)
+            loss = criterion(class_logits, y)
+            total_loss += loss.item() * x.size(0)
             
-            # H(p) = - sum(p * log(p + epsilon))
-            log_probs = torch.log(probs + 1e-8)
-            entropy = -torch.sum(probs * log_probs, dim=1)
+            _, predicted = torch.max(class_logits.data, 1)
+            total += y.size(0)
+            correct += (predicted == y).sum().item()
             
-            total_entropy += torch.sum(entropy).item()
-            total_samples += x.size(0)
-            
-    return total_entropy / total_samples
+    avg_loss = total_loss / total
+    accuracy = 100.0 * correct / total
+    return avg_loss, accuracy
 
-# --------------------------------------------------------
-# 2. Ajuste Dinámico de Parámetros (LR y Alpha)
-# --------------------------------------------------------
-def adjust_learning_rate(optimizer, epoch, num_epochs, base_lr=0.01):
+def train_dann(model, train_source, val_source, target_loader, num_epochs, device, method, source_name, target_name, seed):
     """
-    Aplica el decaimiento polinomial a la tasa de aprendizaje.
+    Bucle de entrenamiento UDA optimizado.
+    Soporta DANN y CDAN, integrando registro de métricas y selección por entropía.
     """
-    p = epoch / num_epochs
-    lr = base_lr / math.pow((1 + 10 * p), 0.75)
+    criterion_cls = nn.CrossEntropyLoss()
+    criterion_domain = nn.BCELoss()
     
-    # El optimizador tendrá 3 grupos de parámetros: backbone (lr*0.1), clasificador (lr), discriminador (lr)
-    optimizer.param_groups[0]['lr'] = lr * 0.1
-    optimizer.param_groups[1]['lr'] = lr
-    optimizer.param_groups[2]['lr'] = lr
-    return lr
-
-def calculate_alpha(epoch, num_epochs):
-    """
-    Calcula el peso adversarial (alpha) para el GRL usando una curva logística.
-    """
-    p = epoch / num_epochs
-    return 2.0 / (1.0 + math.exp(-10.0 * p)) - 1.0
-
-# --------------------------------------------------------
-# 3. Bucle de Entrenamiento Principal
-# --------------------------------------------------------
-def train_dann(model, source_loader, target_loader, num_epochs, device, base_lr=0.01):
-    """
-    Orquesta el entrenamiento de la red adversarial y guarda el mejor modelo basado en Target Entropy.
-    """
-    model = model.to(device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9, weight_decay=5e-4)
     
-    # Criterios de pérdida
-    criterion_class = nn.CrossEntropyLoss()
-    criterion_domain = nn.CrossEntropyLoss()
+    # Inicializar el diccionario para exportar a CSV
+    history = {
+        'epoch': [], 'train_loss_cls': [], 'train_loss_domain': [],
+        'val_source_loss': [], 'val_source_acc': [], 
+        'val_target_entropy': []
+    }
     
-    # Grupos de parámetros con LR diferencial
-    optimizer = optim.SGD([
-        {'params': model.backbone.parameters(), 'lr': base_lr * 0.1},
-        {'params': model.classifier.parameters(), 'lr': base_lr},
-        {'params': model.discriminator.parameters(), 'lr': base_lr}
-    ], momentum=0.9, weight_decay=5e-4)
-
-    best_entropy = float('inf')
-    best_model_state = None
-
-    for epoch in range(num_epochs):
+    best_target_entropy = float('inf')
+    best_model_path = f"./checkpoints/best_model_{method}_{source_name}_to_{target_name}_seed{seed}.pth"
+    
+    os.makedirs("./checkpoints", exist_ok=True)
+    os.makedirs("./logs", exist_ok=True)
+    
+    for epoch in range(1, num_epochs + 1):
         model.train()
-        
-        # Ajustar hiperparámetros dinámicos
-        current_lr = adjust_learning_rate(optimizer, epoch, num_epochs, base_lr)
-        current_alpha = calculate_alpha(epoch, num_epochs)
-        
-        # Iteradores
-        iter_source = iter(source_loader)
-        iter_target = iter(target_loader)
-        num_batches = min(len(source_loader), len(target_loader))
-        
         epoch_loss_cls = 0.0
-        epoch_loss_dom = 0.0
+        epoch_loss_domain = 0.0
+        total_samples = 0
         
-        for _ in range(num_batches):
-            # Cargar datos
-            data_source, label_source = next(iter_source)
-            data_target = next(iter_target)
-            # Desempaquetar el target si el loader devuelve (imagen, etiqueta_falsa)
-            if isinstance(data_target, list) or isinstance(data_target, tuple):
-                data_target = data_target[0]
+        # Cálculo dinámico del parámetro alpha para el GRL
+        p = float(epoch) / num_epochs
+        alpha = 2. / (1. + float(np.exp(-10. * p))) - 1
+        
+        # Iterador conjunto para equilibrar lotes de origen y destino
+        len_dataloader = min(len(train_source), len(target_loader))
+        source_iter = iter(train_source)
+        target_iter = iter(target_loader)
+        
+        for i in range(len_dataloader):
+            # 1. Datos origen
+            s_img, s_label = next(source_iter)
+            s_img, s_label = s_img.to(device), s_label.to(device)
             
-            data_source, label_source = data_source.to(device), label_source.to(device)
-            data_target = data_target.to(device)
+            # 2. Datos destino
+            t_img, _ = next(target_iter)
+            t_img = t_img.to(device)
             
             optimizer.zero_grad()
             
-            # --- ENTRENAMIENTO CON DOMINIO FUENTE ---
-            # Etiquetas de dominio: Fuente = 0
-            domain_label_source = torch.zeros(data_source.size(0), dtype=torch.long).to(device)
+            # --- Forward Pass (Origen) ---
+            class_logits, domain_logits_s, _ = model(s_img, alpha=alpha)
+            loss_cls = criterion_cls(class_logits, s_label)
             
-            class_logits_s, domain_logits_s, _ = model(data_source, alpha=current_alpha)
+            # Las etiquetas del clasificador de dominio para origen son 0
+            domain_label_s = torch.zeros(domain_logits_s.size(0), 1).to(device)
+            loss_domain_s = criterion_domain(domain_logits_s, domain_label_s)
             
-            loss_cls = criterion_class(class_logits_s, label_source)
-            loss_dom_s = criterion_domain(domain_logits_s, domain_label_source)
+            # --- Forward Pass (Destino) ---
+            _, domain_logits_t, _ = model(t_img, alpha=alpha)
             
-            # --- ENTRENAMIENTO CON DOMINIO DESTINO ---
-            # Etiquetas de dominio: Destino = 1
-            domain_label_target = torch.ones(data_target.size(0), dtype=torch.long).to(device)
+            # Las etiquetas del clasificador de dominio para destino son 1
+            domain_label_t = torch.ones(domain_logits_t.size(0), 1).to(device)
+            loss_domain_t = criterion_domain(domain_logits_t, domain_label_t)
             
-            _, domain_logits_t, _ = model(data_target, alpha=current_alpha)
-            loss_dom_t = criterion_domain(domain_logits_t, domain_label_target)
-            
-            # --- PÉRDIDA TOTAL ---
-            loss_dom_total = loss_dom_s + loss_dom_t
-            loss_total = loss_cls + loss_dom_total
-            
-            loss_total.backward()
+            # --- Backpropagation ---
+            loss_domain = loss_domain_s + loss_domain_t
+            loss = loss_cls + loss_domain
+            loss.backward()
             optimizer.step()
             
-            epoch_loss_cls += loss_cls.item()
-            epoch_loss_dom += loss_dom_total.item()
-
-        # Evaluación no supervisada al final de la época
-        target_entropy = calculate_target_entropy(model, target_loader, device)
+            epoch_loss_cls += loss_cls.item() * s_img.size(0)
+            epoch_loss_domain += loss_domain.item() * s_img.size(0)
+            total_samples += s_img.size(0)
+            
+        avg_loss_cls = epoch_loss_cls / total_samples
+        avg_loss_domain = epoch_loss_domain / total_samples
         
-        print(f"Epoch [{epoch+1}/{num_epochs}] | "
-              f"Loss Cls: {epoch_loss_cls/num_batches:.4f} | "
-              f"Loss Dom: {epoch_loss_dom/num_batches:.4f} | "
-              f"Alpha: {current_alpha:.3f} | "
-              f"Target Entropy: {target_entropy:.4f}")
+        # --- Fase de Validación al finalizar la época ---
+        val_src_loss, val_src_acc = evaluate_source_domain(model, val_source, device)
+        val_tgt_entropy = calculate_target_entropy(model, target_loader, device)
         
-        # Selección del modelo: Guardamos el que tenga menor Target Entropy
-        if target_entropy < best_entropy:
-            best_entropy = target_entropy
-            best_model_state = model.state_dict()
-            print(f"  -> Nuevo mejor modelo encontrado! (Entropía: {best_entropy:.4f})")
-
-    print("Entrenamiento finalizado.")
-    # Restaurar los pesos del mejor modelo encontrado
-    model.load_state_dict(best_model_state)
+        # Registrar métricas
+        history['epoch'].append(epoch)
+        history['train_loss_cls'].append(avg_loss_cls)
+        history['train_loss_domain'].append(avg_loss_domain)
+        history['val_source_loss'].append(val_src_loss)
+        history['val_source_acc'].append(val_src_acc)
+        history['val_target_entropy'].append(val_tgt_entropy)
+        
+        print(f"Epoch [{epoch}/{num_epochs}] | Cls Loss: {avg_loss_cls:.4f} | Src Acc: {val_src_acc:.2f}% | Tgt Entropy: {val_tgt_entropy:.4f}")
+        
+        # Selección de Modelo No Supervisada (Mínima Entropía)
+        if val_tgt_entropy < best_target_entropy:
+            best_target_entropy = val_tgt_entropy
+            torch.save(model.state_dict(), best_model_path)
+            print(f"   -> ¡Nuevo modelo guardado! (Menor entropía: {best_target_entropy:.4f})")
+            
+    # --- Finalización y Exportación ---
+    df_history = pd.DataFrame(history)
+    csv_path = f"./logs/history_{method}_{source_name}_to_{target_name}_seed{seed}.csv"
+    df_history.to_csv(csv_path, index=False)
+    
+    # Cargar los pesos del mejor modelo (el de menor entropía) antes de devolverlo para inferencia
+    model.load_state_dict(torch.load(best_model_path))
     return model

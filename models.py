@@ -81,7 +81,8 @@ class DomainDiscriminator(nn.Module):
             nn.Linear(1024, 1024),
             nn.ReLU(inplace=True),
             nn.Dropout(0.5),
-            nn.Linear(1024, 2) # 2 clases: Source (0) o Target (1)
+            nn.Linear(1024, 1),  # salida binaria para BCELoss
+            nn.Sigmoid()
         )
         
         # Inicialización

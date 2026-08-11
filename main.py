@@ -1,14 +1,17 @@
 import argparse
 import random
 import numpy as np
+import pandas as pd
+import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # Importar nuestros módulos
 from data_loader import get_dataloaders
 from models import DANNModel, CDANModel
 from trainer import train_dann
-from flattening_metrics import diagnose_feature_flattening
+from flattening_metrics import diagnose_feature_flattening, ffi
 
 def set_seed(seed):
     """
@@ -53,6 +56,51 @@ def extract_features_and_evaluate(model, dataloader, device):
     
     return features_np, labels_np, accuracy
 
+def evaluate_source_domain(model, dataloader, device):
+    """
+    Evaluates loss and accuracy on a domain where labels are available (Source).
+    """
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    
+    criterion = nn.CrossEntropyLoss()
+    
+    with torch.no_grad():
+        for x, y in dataloader:
+            x, y = x.to(device), y.to(device)
+            class_logits, _, _ = model(x, alpha=0.0)
+            
+            loss = criterion(class_logits, y)
+            total_loss += loss.item() * x.size(0)
+            
+            _, predicted = torch.max(class_logits.data, 1)
+            total += y.size(0)
+            correct += (predicted == y).sum().item()
+            
+    avg_loss = total_loss / total
+    accuracy = 100.0 * correct / total
+    return avg_loss, accuracy
+
+def calculate_target_entropy(model, dataloader, device):
+    """
+    Calculates Shannon Entropy on the target domain predictions (Unsupervised).
+    """
+    model.eval()
+    entropies = []
+    
+    with torch.no_grad():
+        for x, _ in dataloader:
+            x = x.to(device)
+            class_logits, _, _ = model(x, alpha=0.0)
+            
+            probs = F.softmax(class_logits, dim=1)
+            batch_entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1).mean()
+            entropies.append(batch_entropy.item())
+            
+    return sum(entropies) / len(entropies)
+
 def main():
     parser = argparse.ArgumentParser(description="Capacity-Aware UDA Experiments")
     parser.add_argument('--method', type=str, required=True, choices=['Source', 'DANN', 'CDAN'], help="Método de adaptación")
@@ -71,80 +119,113 @@ def main():
     print(f"Dispositivo: {device}")
 
     # 2. Cargar Datos
-    # El dominio fuente nos da train y val (usamos val_source para extraer métricas baseline si se desea)
     train_source, val_source = get_dataloaders(args.data_dir, args.source, batch_size=args.batch_size, is_source=True)
-    # El dominio destino nos da un loader para adaptación y validación final
     target_loader = get_dataloaders(args.data_dir, args.target, batch_size=args.batch_size, is_source=False)
 
     # 3. Instanciar Modelo
     if args.method == 'CDAN':
         model = CDANModel(num_classes=31).to(device)
     else:
-        # Usamos DANNModel tanto para DANN como para Source-Only.
-        # (Para Source-Only, simplemente ignoraremos la pérdida de dominio en un loop especializado, 
-        # o podemos usar train_dann con alpha=0 forzado. Por simplicidad del código modular, 
-        # asumiremos que train_dann maneja la lógica DANN/CDAN).
         model = DANNModel(num_classes=31).to(device)
 
-    # 4. Entrenamiento
+    # 4. Entrenamiento y Registro de Métricas
+    os.makedirs("./checkpoints", exist_ok=True)
+    os.makedirs("./logs", exist_ok=True)
+    best_model_path = f"./checkpoints/best_model_{args.method}_{args.source}_to_{args.target}_seed{args.seed}.pth"
+
     if args.method in ['DANN', 'CDAN']:
-        # Utilizamos nuestro trainer optimizado con Target Entropy
-        model = train_dann(model, train_source, target_loader, num_epochs=args.epochs, device=device)
+        model = train_dann(
+            model=model, 
+            train_source=train_source, 
+            val_source=val_source,         # <--- Agregamos este
+            target_loader=target_loader, 
+            num_epochs=args.epochs, 
+            device=device,
+            method=args.method,            # <--- Y estos de aquí abajo
+            source_name=args.source,
+            target_name=args.target,
+            seed=args.seed
+        )
     else:
-        print("Entrenando Source-Only...")
+        print("Entrenando Source-Only con rastreo de métricas...")
         criterion = nn.CrossEntropyLoss()
-        # Solo optimizamos backbone y clasificador
         optimizer = torch.optim.SGD([
             {'params': model.backbone.parameters(), 'lr': 0.001},
             {'params': model.classifier.parameters(), 'lr': 0.01}
         ], momentum=0.9, weight_decay=5e-4)
         
-        for epoch in range(args.epochs):
+        history = {
+            'epoch': [], 'train_loss': [], 
+            'val_source_loss': [], 'val_source_acc': [], 
+            'val_target_entropy': []
+        }
+        
+        best_target_entropy = float('inf')
+        
+        for epoch in range(1, args.epochs + 1):
             model.train()
             epoch_loss = 0.0
+            total_samples = 0
+            
+            # --- Fase de Entrenamiento ---
             for x, y in train_source:
                 x, y = x.to(device), y.to(device)
                 optimizer.zero_grad()
                 
-                # Pasamos alpha=0 para apagar el GRL
                 class_logits, _, _ = model(x, alpha=0.0)
                 loss = criterion(class_logits, y)
                 
                 loss.backward()
                 optimizer.step()
-                epoch_loss += loss.item()
+                epoch_loss += loss.item() * x.size(0)
+                total_samples += x.size(0)
                 
-            print(f"Epoch [{epoch+1}/{args.epochs}] | Loss Cls: {epoch_loss/len(train_source):.4f}")
+            train_loss_avg = epoch_loss / total_samples
+            
+            # --- Fase de Validación (Rastreo Exhaustivo) ---
+            val_src_loss, val_src_acc = evaluate_source_domain(model, val_source, device)
+            val_tgt_entropy = calculate_target_entropy(model, target_loader, device)
+            
+            # Registrar en historial
+            history['epoch'].append(epoch)
+            history['train_loss'].append(train_loss_avg)
+            history['val_source_loss'].append(val_src_loss)
+            history['val_source_acc'].append(val_src_acc)
+            history['val_target_entropy'].append(val_tgt_entropy)
+            
+            print(f"Epoch [{epoch}/{args.epochs}] | Train Loss: {train_loss_avg:.4f} | Val Src Acc: {val_src_acc:.2f}% | Val Tgt Entropy: {val_tgt_entropy:.4f}")
+            
+            # Unsupervised Model Selection
+            if val_tgt_entropy < best_target_entropy:
+                best_target_entropy = val_tgt_entropy
+                torch.save(model.state_dict(), best_model_path)
+                print(f"   -> ¡Nuevo modelo guardado! (Menor entropía: {best_target_entropy:.4f})")
+                
+        # Exportar historial a CSV
+        df_history = pd.DataFrame(history)
+        csv_path = f"./logs/history_{args.method}_{args.source}_to_{args.target}_seed{args.seed}.csv"
+        df_history.to_csv(csv_path, index=False)
+        print(f"\nHistorial exportado en: {csv_path}")
+        
+        # Cargar el mejor modelo para la evaluación final
+        model.load_state_dict(torch.load(best_model_path))
 
     # 5. Evaluación Final y Extracción de Tensores
-    print("Extrayendo representaciones para diagnóstico de Feature Flattening...")
+    print("\nExtrayendo representaciones para diagnóstico de Feature Flattening...")
     
-    # Extraemos características del dominio fuente (usamos val_source) y del dominio destino
     Z_s, y_s, acc_source = extract_features_and_evaluate(model, val_source, device)
     Z_t, y_t, acc_target = extract_features_and_evaluate(model, target_loader, device)
 
     print(f"Precisión Final en Destino ({args.target}): {acc_target:.2f}%")
 
     # 6. Calcular Métricas de Feature Flattening
-    # Nota: Para usar `diagnose_feature_flattening` estrictamente, necesitaríamos las features
-    # del modelo Baseline (Source-Only). En este script evaluamos el FFI del modelo actual.
-    from flattening_metrics import ffi
-    
-    d = Z_s.shape[1] # Debería ser 256
+    d = Z_s.shape[1] 
     metricas_fuente = ffi(Z_s, y_s, d)
-    # Para el dominio destino usamos las pseudo-etiquetas generadas por el modelo (y_t) para medir separabilidad
     metricas_destino = ffi(Z_t, y_t, d) 
 
     print("\n--- Resultados Matemáticos del Espacio de Características ---")
     print(f"Dominio Fuente  -> erank: {metricas_fuente['erank']:.2f}, DR: {metricas_fuente['DR']:.2f}, FFI: {metricas_fuente['FFI']:.4f}")
     print(f"Dominio Destino -> erank: {metricas_destino['erank']:.2f}, DR: {metricas_destino['DR']:.2f}, FFI: {metricas_destino['FFI']:.4f}")
-
-    # --- NUEVO: Guardar el modelo físicamente en el disco ---
-    import os
-    os.makedirs("./checkpoints", exist_ok=True)
-    nombre_archivo = f"./checkpoints/best_model_{args.method}_{args.source}_to_{args.target}_seed{args.seed}.pth"
-    torch.save(model.state_dict(), nombre_archivo)
-    print(f"\nModelo guardado en: {nombre_archivo}")
 
 if __name__ == '__main__':
     main()
