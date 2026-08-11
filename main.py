@@ -112,40 +112,24 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32, help="Tamaño del lote")
     args = parser.parse_args()
 
-    # 1. Preparar el entorno
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"--- Iniciando Experimento: {args.method} | {args.source} -> {args.target} | Seed: {args.seed} ---")
-    print(f"Dispositivo: {device}")
 
-    # 2. Cargar Datos
     train_source, val_source = get_dataloaders(args.data_dir, args.source, batch_size=args.batch_size, is_source=True)
     target_loader = get_dataloaders(args.data_dir, args.target, batch_size=args.batch_size, is_source=False)
 
-    # 3. Instanciar Modelo
     if args.method == 'CDAN':
         model = CDANModel(num_classes=31).to(device)
     else:
         model = DANNModel(num_classes=31).to(device)
 
-    # 4. Entrenamiento y Registro de Métricas
     os.makedirs("./checkpoints", exist_ok=True)
     os.makedirs("./logs", exist_ok=True)
     best_model_path = f"./checkpoints/best_model_{args.method}_{args.source}_to_{args.target}_seed{args.seed}.pth"
 
     if args.method in ['DANN', 'CDAN']:
-        model = train_dann(
-            model=model, 
-            train_source=train_source, 
-            val_source=val_source,         # <--- Agregamos este
-            target_loader=target_loader, 
-            num_epochs=args.epochs, 
-            device=device,
-            method=args.method,            # <--- Y estos de aquí abajo
-            source_name=args.source,
-            target_name=args.target,
-            seed=args.seed
-        )
+        model = train_dann(model, train_source, val_source, target_loader, args.epochs, device, args.method, args.source, args.target, args.seed)
     else:
         print("Entrenando Source-Only con rastreo de métricas...")
         criterion = nn.CrossEntropyLoss()
@@ -154,8 +138,9 @@ def main():
             {'params': model.classifier.parameters(), 'lr': 0.01}
         ], momentum=0.9, weight_decay=5e-4)
         
+        # NUEVO: Añadimos 'train_acc' al diccionario
         history = {
-            'epoch': [], 'train_loss': [], 
+            'epoch': [], 'train_loss': [], 'train_acc': [],
             'val_source_loss': [], 'val_source_acc': [], 
             'val_target_entropy': []
         }
@@ -165,9 +150,9 @@ def main():
         for epoch in range(1, args.epochs + 1):
             model.train()
             epoch_loss = 0.0
+            correct_train = 0
             total_samples = 0
             
-            # --- Fase de Entrenamiento ---
             for x, y in train_source:
                 x, y = x.to(device), y.to(device)
                 optimizer.zero_grad()
@@ -178,47 +163,43 @@ def main():
                 loss.backward()
                 optimizer.step()
                 epoch_loss += loss.item() * x.size(0)
+                
+                # NUEVO: Calcular aciertos
+                _, predicted = torch.max(class_logits.data, 1)
+                correct_train += (predicted == y).sum().item()
                 total_samples += x.size(0)
                 
             train_loss_avg = epoch_loss / total_samples
+            train_acc = 100.0 * correct_train / total_samples
             
-            # --- Fase de Validación (Rastreo Exhaustivo) ---
             val_src_loss, val_src_acc = evaluate_source_domain(model, val_source, device)
             val_tgt_entropy = calculate_target_entropy(model, target_loader, device)
             
-            # Registrar en historial
             history['epoch'].append(epoch)
             history['train_loss'].append(train_loss_avg)
+            history['train_acc'].append(train_acc)
             history['val_source_loss'].append(val_src_loss)
             history['val_source_acc'].append(val_src_acc)
             history['val_target_entropy'].append(val_tgt_entropy)
             
-            print(f"Epoch [{epoch}/{args.epochs}] | Train Loss: {train_loss_avg:.4f} | Val Src Acc: {val_src_acc:.2f}% | Val Tgt Entropy: {val_tgt_entropy:.4f}")
+            print(f"Epoch [{epoch}/{args.epochs}] | Train Loss: {train_loss_avg:.4f} | Train Acc: {train_acc:.2f}% | Src Acc: {val_src_acc:.2f}% | Tgt Entropy: {val_tgt_entropy:.4f}")
             
-            # Unsupervised Model Selection
             if val_tgt_entropy < best_target_entropy:
                 best_target_entropy = val_tgt_entropy
                 torch.save(model.state_dict(), best_model_path)
-                print(f"   -> ¡Nuevo modelo guardado! (Menor entropía: {best_target_entropy:.4f})")
                 
-        # Exportar historial a CSV
         df_history = pd.DataFrame(history)
         csv_path = f"./logs/history_{args.method}_{args.source}_to_{args.target}_seed{args.seed}.csv"
         df_history.to_csv(csv_path, index=False)
-        print(f"\nHistorial exportado en: {csv_path}")
-        
-        # Cargar el mejor modelo para la evaluación final
         model.load_state_dict(torch.load(best_model_path))
 
-    # 5. Evaluación Final y Extracción de Tensores
+    # --- Evaluación Final ---
     print("\nExtrayendo representaciones para diagnóstico de Feature Flattening...")
-    
     Z_s, y_s, acc_source = extract_features_and_evaluate(model, val_source, device)
     Z_t, y_t, acc_target = extract_features_and_evaluate(model, target_loader, device)
 
     print(f"Precisión Final en Destino ({args.target}): {acc_target:.2f}%")
 
-    # 6. Calcular Métricas de Feature Flattening
     d = Z_s.shape[1] 
     metricas_fuente = ffi(Z_s, y_s, d)
     metricas_destino = ffi(Z_t, y_t, d) 
@@ -226,6 +207,17 @@ def main():
     print("\n--- Resultados Matemáticos del Espacio de Características ---")
     print(f"Dominio Fuente  -> erank: {metricas_fuente['erank']:.2f}, DR: {metricas_fuente['DR']:.2f}, FFI: {metricas_fuente['FFI']:.4f}")
     print(f"Dominio Destino -> erank: {metricas_destino['erank']:.2f}, DR: {metricas_destino['DR']:.2f}, FFI: {metricas_destino['FFI']:.4f}")
+
+    # --- NUEVO: Exportar resumen de métricas a un archivo global ---
+    resumen_file = "./logs/resumen_resultados_global.csv"
+    file_exists = os.path.isfile(resumen_file)
+    with open(resumen_file, 'a') as f:
+        # Escribir la cabecera si el archivo no existe
+        if not file_exists:
+            f.write("Metodo,Origen,Destino,Seed,Target_Acc,Src_Erank,Src_DR,Src_FFI,Tgt_Erank,Tgt_DR,Tgt_FFI\n")
+        # Escribir los datos de esta corrida
+        f.write(f"{args.method},{args.source},{args.target},{args.seed},{acc_target:.2f},{metricas_fuente['erank']:.2f},{metricas_fuente['DR']:.2f},{metricas_fuente['FFI']:.4f},{metricas_destino['erank']:.2f},{metricas_destino['DR']:.2f},{metricas_destino['FFI']:.4f}\n")
+    print(f"Métricas finales agregadas exitosamente a: {resumen_file}")
 
 if __name__ == '__main__':
     main()
