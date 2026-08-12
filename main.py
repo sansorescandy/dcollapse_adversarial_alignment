@@ -112,6 +112,29 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32, help="Tamaño del lote")
     args = parser.parse_args()
 
+    # --- EXPERIMENT RESUME LOGIC ---
+    summary_file = "./logs/resumen_resultados_global.csv"
+    
+    if os.path.isfile(summary_file):
+        try:
+            df_summary = pd.read_csv(summary_file)
+            
+            # Check for an exact match of the current experiment configuration
+            already_processed = df_summary[
+                (df_summary['Metodo'] == args.method) & 
+                (df_summary['Origen'] == args.source) & 
+                (df_summary['Destino'] == args.target) & 
+                (df_summary['Seed'] == args.seed)
+            ]
+            
+            if not already_processed.empty:
+                print(f"⏭️ Skipping: Experiment {args.method} ({args.source} -> {args.target} | Seed {args.seed}) is already completed.")
+                sys.exit(0) # Exit the script cleanly
+                
+        except Exception as e:
+            print(f"Warning: Could not verify the summary log. Proceeding with execution. Error: {e}")
+    # -------------------------------
+
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"--- Iniciando Experimento: {args.method} | {args.source} -> {args.target} | Seed: {args.seed} ---")
