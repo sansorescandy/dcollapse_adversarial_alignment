@@ -1,9 +1,10 @@
+import sys
+import os
+import pandas as pd
 import argparse
+import torch
 import random
 import numpy as np
-import pandas as pd
-import os
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
