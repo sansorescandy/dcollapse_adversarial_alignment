@@ -2,7 +2,7 @@
 
 # Asegúrate de dar permisos de ejecución a este archivo: chmod +x run_experiments.sh
 
-DATA_DIR="./data/office31"
+DATA_DIR="/content/data/office31"
 LOG_DIR="./logs"
 CHECKPOINT_DIR="./checkpoints"
 EPOCHS=50
