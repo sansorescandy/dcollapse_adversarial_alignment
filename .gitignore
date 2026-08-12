@@ -1,7 +1,8 @@
 logs/
 checkpoints/
-data/
+data/*
 *.pth
 *.csv
 *.zip
 __pycache__/
+!data/.gitkeep
