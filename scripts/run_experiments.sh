@@ -6,7 +6,8 @@ DATA_DIR="./data/office31"
 LOG_DIR="./logs"
 CHECKPOINT_DIR="./checkpoints"
 EPOCHS=50
-SEEDS=(42 10 99 123 777)
+# Expandimos a 10 semillas para poder estadístico
+SEEDS=(42 10 99 123 777 11 22 33 44 55)
 METHODS=("Source" "DANN" "CDAN")
 TASKS=(
     "amazon webcam"
@@ -21,7 +22,7 @@ TASKS=(
 mkdir -p $LOG_DIR
 mkdir -p $CHECKPOINT_DIR
 
-echo "Iniciando Batería de Experimentos UDA..."
+echo "Starting UDA Experiment Battery..."
 
 # Bucle triple: Método -> Tarea -> Semilla
 for method in "${METHODS[@]}"; do
@@ -36,8 +37,8 @@ for method in "${METHODS[@]}"; do
             LOG_FILE="${LOG_DIR}/${method}_${source_dom}_to_${target_dom}_seed${seed}.log"
             
             echo "================================================================="
-            echo "Ejecutando: Método=$method | Tarea=$source_dom->$target_dom | Seed=$seed"
-            echo "El progreso se está guardando silenciosamente en: $LOG_FILE"
+            echo "Running: Method=$method | Task=$source_dom->$target_dom | Seed=$seed"
+            echo "Progress is silently logged to: $LOG_FILE"
             echo "================================================================="
             
             # Ejecutar Python y redirigir salida estándar y de errores al log
@@ -53,4 +54,4 @@ for method in "${METHODS[@]}"; do
     done
 done
 
-echo "Todos los experimentos han finalizado exitosamente."
+echo "All experiments have finished successfully."
